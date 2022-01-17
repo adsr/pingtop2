@@ -1,0 +1,273 @@
+<?php
+declare(strict_types=1);
+
+class PingMetrics {
+    public function __construct(
+        private int $range_s
+    ) {
+    }
+}
+
+class PingProc {
+    public array $pipes = [];
+    public mixed $proc = null;
+    public string $output = '';
+    public bool $dead = true;
+    public array $hits = [];
+    public array $misses = [];
+    public array $range_metrics = [];
+    public ?string $last_hit_or_miss;
+
+    public function __construct(
+        public string $host
+    ) {
+        $this->reset();
+    }
+
+    private function reset(): void {
+        $this->pipes = [];
+        $this->proc = null;
+        $this->output = '';
+        $this->dead = true;
+        $this->hits = [];
+        $this->misses = [];
+        $this->range_metrics = [];
+        $this->last_hit_or_miss = null;
+    }
+
+    public function open() {
+        $cmd = sprintf('ping -DO %s', escapeshellarg($this->host));
+        $spec = [
+            [ 'pipe', 'r' ],
+            [ 'pipe', 'w' ],
+            [ 'file', '/dev/null', 'a' ],
+        ];
+        $pipes = [];
+        $proc = proc_open($cmd, $spec, $pipes);
+        if ($proc === false) {
+            throw new RuntimeException("proc_open: Failed to exec ping");
+        }
+        stream_set_blocking($pipes[1], false);
+        $this->proc = $proc;
+        $this->pipes = $pipes;
+    }
+
+    public function getReadFp(): mixed {
+        if (!isset($this->pipes[1])) {
+            throw new RuntimeException("getReadFp: No pipe");
+        }
+        return $this->pipes[1];
+    }
+
+    public function readAndParse(): void {
+        $this->readFp();
+        $this->parseOutput();
+    }
+
+    private function readFp() {
+        $chunk = fread($this->getReadFp(), 64);
+        if ($chunk === false) {
+            proc_close($this->proc);
+            $this->reset();
+        } else {
+            $this->output .= $chunk;
+        }
+    }
+
+    private function parseOutput(): void {
+        while (true) {
+            $nl = strpos($this->output, "\n");
+            if ($nl === false) {
+                break;
+            }
+            $line = substr($this->output, 0, $nl);
+            $this->parseLine($line);
+            $this->output = substr($this->output, $nl + 1);
+        }
+    }
+
+    private function parseLine(string $line): void {
+        $re_success = '/^\[(?<unix_ts>\d+\.\d+)\] \d+ bytes from [^:]+: icmp_seq=(?<icmp_seq>\d+) ttl=\d+ time=(?<latency_ms>\d+\.\d+) ms$/';
+        $re_miss =    '/^\[(?<unix_ts>\d+\.\d+)\] no answer yet for icmp_seq=\d+$/';
+        $matches = [];
+        if (preg_match($re_success, $line, $matches)) {
+            $unix_ts = (float)$matches['unix_ts'];
+            $icmp_seq = (int)$matches['icmp_seq'];
+            $latency_ms = (float)$matches['latency_ms'];
+            $this->hits["{$unix_ts}"] = $latency_ms;
+            $this->last_hit_or_miss = sprintf('%6.1f', $latency_ms);
+        } else if (preg_match($re_miss, $line, $matches)) {
+            $unix_ts = (float)$matches['unix_ts'];
+            $this->misses["{$unix_ts}"] = 1;
+            $this->last_hit_or_miss = '<miss>';
+        }
+    }
+
+    public function updateMetrics(float $now_ts, array $ranges): void {
+        $range_metrics = [];
+
+        $bucketIntoRanges = function(&$map, $ranges, $label) use (&$range_metrics, $now_ts) {
+            $num_fresh = 0;
+            foreach ($map as $unix_ts => $val) {
+                $unix_ts = (float)$unix_ts;
+                $in_any_range = false;
+
+                foreach ($ranges as $range_s) {
+                    $range_start_ts = $now_ts - $range_s;
+
+                    if ($unix_ts >= $range_start_ts) {
+                        $range_metrics[$range_s][$label][] = $val;
+                        $in_any_range = true;
+                    }
+                }
+
+                if ($in_any_range) {
+                    $num_fresh += 1;
+                }
+            }
+
+            $num_stale = count($map) - $num_fresh;
+            $map = array_slice(
+                $map,
+                $num_stale,
+                $num_fresh,
+                true
+            );
+        };
+
+        $bucketIntoRanges($this->hits, $ranges, 'hits');
+        $bucketIntoRanges($this->misses, $ranges, 'misses');
+
+        foreach ($ranges as $range_s) {
+            $latencies = $range_metrics[$range_s]['hits'] ?? [];
+            if (count($latencies) < 1) {
+                continue;
+            }
+            $num_latencies = count($latencies);
+            $num_misses = count($range_metrics[$range_s]['misses'] ?? []);
+
+            $metrics = &$range_metrics[$range_s];
+            $metrics['min'] = min($latencies);
+            $metrics['max'] = max($latencies);
+            $metrics['p50'] = $this->perc($latencies, 50);
+            $metrics['p95'] = $this->perc($latencies, 95);
+            $metrics['nmiss'] = $num_misses;
+            $metrics['pmiss'] = ($num_misses / ($num_latencies + $num_misses)) * 100.0;
+        }
+
+        $this->range_metrics = $range_metrics;
+    }
+
+    private function perc(array $values, int $nth): mixed {
+        $num_values = count($values);
+        $index = (int)floor($nth / (100.0 / $num_values));
+        return $values[$index];
+    }
+}
+
+class PingTop {
+    private array $ping_procs = [];
+    private array $read_fp_map = [];
+    private bool $show_help = false;
+    private array $ranges = [10, 60, 600];
+
+    public function run() {
+        $this->parseOpts();
+        if ($this->show_help) {
+            $this->exitWithUsage(0);
+        }
+        $this->runPings();
+        $this->loop();
+    }
+
+    private function parseOpts(): void {
+        // TODO 
+        for ($i = 1; $i < $GLOBALS['argc']; $i++) {
+            $this->ping_procs[] = new PingProc($GLOBALS['argv'][$i]);
+        }
+    }
+
+    private function exitWithUsage(int $exit_code): void {
+        // TODO
+    }
+
+    private function runPings(): void {
+        foreach ($this->ping_procs as $ping_proc) {
+            $ping_proc->open();
+        }
+    }
+
+    private function loop(): void {
+        $done = false;
+        $display_ts = 0;
+        do {
+            $r = [];
+            $w = [];
+            $e = [];
+            $now_ts = microtime(true);
+            foreach ($this->ping_procs as $ping_proc) {
+                $r[] = $ping_proc->getReadFp();
+            }
+            // $r[] = '/dev/tty';
+            $rv = stream_select($r, $w, $e, 1);
+            foreach ($r as $readable) {
+                foreach ($this->ping_procs as $ping_proc) {
+                    if ($readable === $ping_proc->getReadFp()) {
+                        $ping_proc->readAndParse();
+                        $ping_proc->updateMetrics($now_ts, $this->ranges);
+                    }
+                }
+            }
+            if ($now_ts - $display_ts > 1.0) {
+                $this->display();
+                $display_ts = $now_ts;
+            }
+        } while (!$done);
+    }
+
+    private function display(): void {
+        static $first = true;
+        if ($first) {
+            echo "\e7"; // save cursor
+            $first = false;
+        }
+        echo "\e8"; // restore saved cursor
+        echo "\e[J"; // clear from cursor down
+        printf(
+            "%24s %6s %6s %24s %6s %6s %6s %6s %6s %6s\n\n",
+            'host', 'last', 'range', 'graph', 'miss', '%miss', 'p50', 'p95', 'min', 'max'
+        );
+        foreach ($this->ping_procs as $ping_proc) {
+            $is_first_range = true;
+            foreach ($this->ranges as $range_s) {
+                $graph_str = '...'; // TODO
+                printf(
+                    "%24s %6s %6s %24s %6d %6.1f %6.1f %6.1f %6.1f %6.1f\n",
+                    $is_first_range ? $ping_proc->host : '',
+                    $is_first_range ? ($ping_proc->last_hit_or_miss ?: '?') : '',
+                    $range_s,
+                    $graph_str,
+                    $ping_proc->range_metrics[$range_s]['pmiss'] ?? '?',
+                    $ping_proc->range_metrics[$range_s]['nmiss'] ?? '?',
+                    $ping_proc->range_metrics[$range_s]['p50'] ?? '?',
+                    $ping_proc->range_metrics[$range_s]['p95'] ?? '?',
+                    $ping_proc->range_metrics[$range_s]['min'] ?? '?',
+                    $ping_proc->range_metrics[$range_s]['max'] ?? '?',
+                );
+                $is_first_range = false;
+            }
+            echo "\n";
+        }
+    }
+}
+
+
+(new PingTop())->run();
+
+/*
+host  last  range graph              range  loss  p50  p95  min  max
+
+blah  12.4  1m    __--_-__--__---    1m     0.2%
+            1h    ---_-_--_---_-     1h     5.2%
+            12h   -__----_--__--_    12h    0.0%
+*/
